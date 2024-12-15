@@ -20,6 +20,23 @@ public class WikimediaChangesProducer {
         properties.setProperty(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
         properties.setProperty(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
 
+        // high throughput at the expense of a bit of latency and CPU usage
+        properties.setProperty(ProducerConfig.COMPRESSION_TYPE_CONFIG, "snappy");
+        properties.setProperty(ProducerConfig.LINGER_MS_CONFIG, "20"); // time to wait until we send a batch
+        properties.setProperty(ProducerConfig.BATCH_SIZE_CONFIG, Integer.toString(32*1024));
+
+        /*
+        Note: Kafka versions >= 2.4 are safe producers by default, i.e., acks = all, retries = max int,
+        max.in.flight.requests.per.connection = 5 messages batches (has to do with parallel processing and batching),
+        enable.idempotence (prevent duplicates)
+        - replication factor = 3, acks = -1 (by all in-sync replicas), min.insync.replicas = 2
+        is the guaranteed setup for data durability and availability because it can handle
+        one broker going down
+        - If producer sends faster than what the broker can receive, records will be buffered in the memory
+        (32 mb). If the buffer gets full, send() will be blocked. If it remains so and
+        max.block.ms has elapsed, exception will be thrown.
+        */
+
         KafkaProducer<String, String> producer = new KafkaProducer<>(properties);
 
         String topic = "wikimedia.recentchange";
