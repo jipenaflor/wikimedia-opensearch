@@ -53,6 +53,6 @@ public class WikimediaChangesProducer {
         eventSource.start();
 
         // produce for 3 minutes then block the program
-        TimeUnit.MINUTES.sleep(3);
+        TimeUnit.MINUTES.sleep(1);
     }
 }
