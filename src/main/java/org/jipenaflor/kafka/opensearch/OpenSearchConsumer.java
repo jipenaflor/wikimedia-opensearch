@@ -1,5 +1,6 @@
 package org.jipenaflor.kafka.opensearch;
 
+import com.google.gson.JsonParser;
 import org.apache.http.HttpHost;
 import org.apache.http.auth.AuthScope;
 import org.apache.http.auth.UsernamePasswordCredentials;
@@ -7,7 +8,10 @@ import org.apache.http.client.CredentialsProvider;
 import org.apache.http.impl.client.BasicCredentialsProvider;
 import org.apache.http.impl.client.DefaultConnectionKeepAliveStrategy;
 import org.apache.kafka.clients.consumer.*;
+import org.apache.kafka.common.errors.WakeupException;
 import org.apache.kafka.common.serialization.StringDeserializer;
+import org.opensearch.action.bulk.BulkRequest;
+import org.opensearch.action.bulk.BulkResponse;
 import org.opensearch.action.index.IndexRequest;
 import org.opensearch.action.index.IndexResponse;
 import org.opensearch.client.RequestOptions;
@@ -68,10 +72,17 @@ public class OpenSearchConsumer {
         properties.setProperty(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
         properties.setProperty(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
         properties.setProperty(ConsumerConfig.GROUP_ID_CONFIG, groupId);
-        properties.setProperty(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "latest");
-        properties.setProperty(ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG, CooperativeStickyAssignor.class.getName());
+        properties.setProperty(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest"); // latest - end; none - exception if no offset found
+        // properties.setProperty(ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG, CooperativeStickyAssignor.class.getName());
+        properties.setProperty(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
 
         return new KafkaConsumer<>(properties);
+    }
+
+    public static String extractId(String json) {
+        return JsonParser.parseString(json).getAsJsonObject()
+                .get("meta").getAsJsonObject()
+                .get("id").getAsString();
     }
 
     public static void main(String[] args) throws IOException {
@@ -83,6 +94,21 @@ public class OpenSearchConsumer {
 
         // create Kafka client
         KafkaConsumer<String, String> kafkaConsumer = createKafkaConsumer();
+
+        // graceful shutdown: get a reference to the main thread then add shutdown hook
+        final Thread mainThread = Thread.currentThread();
+        Runtime.getRuntime().addShutdownHook(new Thread() {
+            public void run() {
+                log.info("Shutdown detected. Calling consumer.wakeup() to exit...");
+                kafkaConsumer.wakeup();
+                // join the main thread to allow the execution of the code in the main thread
+                try {
+                    mainThread.join();
+                } catch (InterruptedException e) {
+                    throw new RuntimeException(e);
+                }
+            }
+        });
 
         // create an index
         try (openSearchClient; kafkaConsumer) {
@@ -103,17 +129,59 @@ public class OpenSearchConsumer {
                 int recordCtr = records.count();
                 log.info("Received records: " + recordCtr);
 
+                // for batching records since sending index requests one by one is inefficient
+                BulkRequest bulkRequest = new BulkRequest();
+
                 for (ConsumerRecord<String, String> record: records) {
+                    /*
+                    Strategies to ensure idempotence of the consumer:
+                    - define an ID using the record coordinates
+                    eg. String id = record.topic() + record.partition() + record.offset();
+                    - utilize the id, if it exists, of the record
+                    */
+
+                    String id = extractId(record.value());
+
                     // send record to OpenSearch
                     IndexRequest indexRequest = new IndexRequest("wikimedia")
-                            .source(record.value(), XContentType.JSON);
-                    IndexResponse indexResponse = openSearchClient.index(indexRequest, RequestOptions.DEFAULT);
-                    log.info("ID " + indexResponse.getId() + " received");
+                            .source(record.value(), XContentType.JSON)
+                            .id(id);    // id included so that opensearch does not provide one
+                                        // also useful in updating the same record if processing fails
+
+                    bulkRequest.add(indexRequest);
+                    // IndexResponse indexResponse = openSearchClient.index(indexRequest, RequestOptions.DEFAULT);
+                    // log.info("ID " + indexResponse.getId() + " received");
+                }
+
+                if (bulkRequest.numberOfActions() > 0) {
+                    BulkResponse bulkResponse = openSearchClient.bulk(bulkRequest, RequestOptions.DEFAULT);
+                    log.info("Inserted " + bulkResponse.getItems().length + " records.");
+
+                    try {
+                        Thread.sleep(1000);
+                    } catch (InterruptedException e) {
+                        throw new RuntimeException(e);
+                    }
+
+                    /*
+                    at most once - commit as soon as the message is received, possibility of loss
+                    at least once - commit after processing, if it goes wrong it will be read again;
+                        possibility of duplicates so ensure that process is idempotent
+                    */
+
+                    // commit offset after the batch is consumed ("at least once" commit strategy)
+                    kafkaConsumer.commitSync();
+                    log.info("Offset has been committed.");
                 }
             }
+        } catch (WakeupException e) {
+            log.info("Consumer is starting to shut down...");
+        } catch (Exception e) {
+            log.info("Unexpected exception in the consumer", e);
+        } finally {
+            kafkaConsumer.close(); // also commits offsets
+            openSearchClient.close();
+            log.info("The consumer is gracefully shut down...");
         }
-
-        // close
-
     }
 }

@@ -52,7 +52,7 @@ public class WikimediaChangesProducer {
         // start the producer in another thread
         eventSource.start();
 
-        // produce for 3 minutes then block the program
+        // produce for 1-minute then block the program
         TimeUnit.MINUTES.sleep(1);
     }
 }
